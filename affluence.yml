@@ -1,0 +1,64 @@
+name: Affluence du Crous 🏃
+
+on:
+  schedule:
+    # Toutes les 15 min, lun-ven, de 9h à 12h59 UTC = couvre 11h30–13h30 Paris
+    # en heure d'été (UTC+2) ET d'hiver (UTC+1). Le script (affluence_bot.py)
+    # ignore tout run hors de 11h30–13h45 heure de Paris : rien à retoucher au
+    # changement d'heure. Minutes « non rondes » (3,18,33,48) pour éviter les
+    # retards de planification GitHub sur :00/:15/:30/:45.
+    - cron: "3,18,33,48 9-12 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Ignorer le garde-fou jour/heure (test manuel)"
+        type: boolean
+        default: true
+      dry_run:
+        description: "Afficher le message dans les logs sans l'envoyer à Discord"
+        type: boolean
+        default: false
+
+concurrency:
+  group: affluence
+  cancel-in-progress: false
+
+jobs:
+  affluence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: 📂 Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: affluence_state.json
+          key: affluence-state-${{ github.run_id }}
+          restore-keys: |
+            affluence-state-
+
+      - name: 🏃 Check affluence
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || '0' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: python affluence_bot.py
+
+      - name: 💾 Save state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: affluence_state.json
+          key: affluence-state-${{ github.run_id }}

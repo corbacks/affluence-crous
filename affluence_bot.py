@@ -78,6 +78,8 @@ def load_state(today: str) -> dict:
 
 
 def save_state(state: dict) -> None:
+    if DRY_RUN:
+        return   # un test à blanc ne doit pas marquer des paliers comme « déjà notifiés »
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
 

@@ -25,10 +25,11 @@ on:
         type: boolean
         default: false
 
-# Un seul run à la fois : si un départ de secours arrive pendant qu'un run tourne,
-# il attend, puis sort aussitôt (heure de fin dépassée).
+# Un seul run automatique à la fois : un départ de secours attend puis sort aussitôt.
+# Les tests manuels ont leur propre groupe : ils ne font jamais la queue derrière
+# la boucle d'un run automatique.
 concurrency:
-  group: affluence
+  group: affluence-${{ github.event_name == 'workflow_dispatch' && 'manuel' || 'auto' }}
   cancel-in-progress: false
 
 jobs:
@@ -78,7 +79,8 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           FORCE_RUN: ${{ github.event.inputs.force_run || '0' }}
           DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
-          POLL_SECONDS: "120"
+          # Test manuel : un seul contrôle (pas de boucle de 2h30)
+          POLL_SECONDS: ${{ github.event_name == 'workflow_dispatch' && '0' || '120' }}
           LOOP_UNTIL: "13:35"
         run: python -u affluence_bot.py
 

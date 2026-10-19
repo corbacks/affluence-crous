@@ -7,7 +7,7 @@ on:
     # ignore tout run hors de 11h30–13h45 heure de Paris : rien à retoucher au
     # changement d'heure. Minutes « non rondes » (3,18,33,48) pour éviter les
     # retards de planification GitHub sur :00/:15/:30/:45.
-    - cron: "3,18,33,48 2-8 * * 1-5"
+    - cron: "3,18,33,48 10-14 * * 1-5"
 
   workflow_dispatch:
     inputs:

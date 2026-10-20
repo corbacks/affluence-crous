@@ -38,7 +38,7 @@ FICHE_URL   = f"https://restos.lescrous.fr/fiche/{RESTO_ID}"
 NOM         = "Restaurant Porte Océane"
 BOT_NAME    = "Le GOAT du Crous"
 
-SEUIL       = int(os.getenv("SEUIL", "200"))   # écart déclenchant un message
+SEUIL       = int(os.getenv("SEUIL", "2000"))   # écart déclenchant un message
 PALIERS     = (100, 500, 1000)                  # la jauge pleine (1100) est gérée à part
 
 # Mode « boucle » : le script se contrôle lui-même au lieu de dépendre de la précision

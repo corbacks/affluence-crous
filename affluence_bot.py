@@ -6,18 +6,18 @@ Lit l'affluence « en direct » (la même que l'iframe de la page du restaurant 
 https://restos.lescrous.fr/fiche/90-12-33-1 → API /api/ecran/90-12-33-1)
 et prévient sur Discord avec un embed (barre de progression, couleurs Crous).
 
-Règles :
-- Aucune restriction horaire dans le script : c'est le cron du workflow qui
-  décide quand il tourne. Hors service, l'API n'a pas de jauge exploitable et
-  le bot reste silencieux tout seul.
-- Un message est envoyé :
-    • quand un PALIER est atteint (100, 500, 1000 repas), une seule fois par jour ;
-    • quand la jauge est atteinte → « Crous fermé pour aujourd'hui », une seule
-      fois, puis silence jusqu'au lendemain ;
-    • quand l'écart avec le dernier message est d'au moins 200 repas (plus ou
-      moins) → nouveau nombre + « Il faut se dépêcher !!! ».
-  Si plusieurs de ces événements tombent au même passage : un seul message.
+Messages envoyés (chacun au plus une fois par jour) :
+    • OUVERTURE (≈ 11h30)   : le Crous est ouvert + nombre de repas + PRÉVISION du jour
+                              (total attendu, créneau de 15 min le plus chargé / le plus calme) ;
+    • PALIERS 100 / 500 / 1000 repas (+ prévision et pic prévu) ;
+    • JAUGE atteinte        : « Crous fermé pour aujourd'hui » ;
+    • BILAN FINAL (13h30)   : nombre final de repas, écart avec la prévision,
+                              pic et creux réels.
+
+Chaque relevé est enregistré dans data/history.json : c'est cet historique qui
+alimente les prévisions et l'image du bilan hebdomadaire (bilan.py, vendredi soir).
 """
+import copy
 import json
 import os
 import sys
@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
+
+import stats
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -38,13 +40,12 @@ FICHE_URL   = f"https://restos.lescrous.fr/fiche/{RESTO_ID}"
 NOM         = "Restaurant Porte Océane"
 BOT_NAME    = "Le GOAT du Crous"
 
-SEUIL       = int(os.getenv("SEUIL", "2000"))   # écart déclenchant un message
 PALIERS     = (100, 500, 1000)                  # la jauge pleine (1100) est gérée à part
 
 # Mode « boucle » : le script se contrôle lui-même au lieu de dépendre de la précision
 # du cron GitHub (qui n'est pas garantie). POLL_SECONDS=0 → un seul contrôle puis sortie.
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "0"))
-LOOP_UNTIL   = os.getenv("LOOP_UNTIL", "13:35")      # heure de Paris, fin de la boucle
+LOOP_UNTIL   = os.getenv("LOOP_UNTIL", "13:35")      # heure de Paris, fin de boucle (garde-fou)
 
 FORCE_RUN = os.getenv("FORCE_RUN", "0") in ("1", "true", "True")  # ignore le garde-fou week-end
 DRY_RUN   = os.getenv("DRY_RUN", "0") in ("1", "true", "True")    # affiche au lieu d'envoyer
@@ -60,26 +61,38 @@ COL_CORAIL  = 0xFF6F5A   # (255, 111, 90)
 COL_FERME   = 0x7A2E5B   # aubergine clair, lisible sur fond sombre
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ÉTAT (conservé entre les runs via actions/cache, remis à zéro chaque jour)
+# ÉTAT DU JOUR (conservé entre les runs via actions/cache, remis à zéro chaque jour)
 # ══════════════════════════════════════════════════════════════════════════════
+
+STATE_DEFAULTS = {
+    "last_sent": None,       # repas au dernier message (pour « depuis le dernier point »)
+    "closed": False,         # jauge atteinte
+    "paliers": [],           # paliers déjà notifiés
+    "opened": False,         # message d'ouverture envoyé
+    "final_sent": False,     # bilan de 13h30 envoyé
+    "last_repas": None,      # dernier nombre de repas valide (sert au bilan de 13h30)
+    "jauge": None,
+    "forecast_done": False,  # prévision du jour calculée (une seule fois, le matin)
+    "forecast": None,
+}
+
 
 def load_state(today: str) -> dict:
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
         if state.get("date") == today:
-            state.setdefault("last_sent", None)
-            state.setdefault("closed", False)
-            state.setdefault("paliers", [])
+            for k, v in STATE_DEFAULTS.items():
+                state.setdefault(k, copy.deepcopy(v))
             return state
     except (OSError, ValueError):
         pass
-    return {"date": today, "last_sent": None, "closed": False, "paliers": []}
+    return {"date": today, **copy.deepcopy(STATE_DEFAULTS)}
 
 
 def save_state(state: dict) -> None:
     if DRY_RUN:
-        return   # un test à blanc ne doit pas marquer des paliers comme « déjà notifiés »
+        return   # un test à blanc ne doit pas marquer des événements comme « déjà notifiés »
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
 
@@ -131,6 +144,10 @@ def fmt(n: int) -> str:
     return f"{n:,}".replace(",", "\u202f")          # 1 100 (espace fine insécable)
 
 
+def signed(n: int) -> str:
+    return f"{n:+d}".replace("-", "−")
+
+
 def pourcentage(repas: int, jauge: int) -> int:
     pct = repas * 100 // jauge
     return 100 if repas >= jauge else min(pct, 99)
@@ -164,25 +181,55 @@ def prochain_palier(repas: int, jauge: int, state: dict):
     return None
 
 
-def build_embed(kind: str, repas: int, jauge: int, state: dict, maj, palier=None) -> dict:
-    """kind : 'palier' | 'ecart' | 'ferme'."""
+def forecast_fields(forecast, jauge: int, compact: bool = False) -> list:
+    """Champs « prévision » : total attendu, pic (créneau de 15 min) et, hors mode compact, creux."""
+    if not forecast:
+        if compact:
+            return []
+        return [{"name": "📈 Prévision du jour",
+                 "value": "Pas encore d'historique — elle apparaîtra dès qu'un service complet aura été enregistré.",
+                 "inline": False}]
+    pct = pourcentage(min(forecast["total"], jauge), jauge)
+    fields = [{"name": "📈 Prévision du jour",
+               "value": f"**≈ {fmt(forecast['total'])}** repas ({pct} %)", "inline": True}]
+    if forecast.get("peak") is not None:
+        fields.append({"name": "🔥 Pic prévu",
+                       "value": f"**{stats.slot_label(forecast['peak'])}**\n~{fmt(forecast['peak_flow'])} repas",
+                       "inline": True})
+        if not compact:
+            fields.append({"name": "😌 Le plus calme",
+                           "value": f"**{stats.slot_label(forecast['low'])}**\n~{fmt(forecast['low_flow'])} repas",
+                           "inline": True})
+    return fields
+
+
+def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
+                palier=None, day=None) -> dict:
+    """kind : 'ouverture' | 'palier' | 'ferme' | 'final'."""
     carre, couleur = tier(repas, jauge)
     pct = pourcentage(repas, jauge)
     restant = max(jauge - repas, 0)
+    forecast = state.get("forecast")
+    quand = (maj or datetime.now(TZ)).strftime("%H:%M")
+    footer = f"Données de {quand} · CROUS Normandie"
 
     if kind == "ferme":
         accroche = "⛔ **Capacité atteinte — le Crous est fermé pour aujourd'hui.**"
-    elif kind == "palier" and palier == PALIERS[0]:
+    elif kind == "ouverture":
+        accroche = "🍽️ **Le Crous est ouvert** — service jusqu'à 13h30."
+    elif kind == "final":
+        accroche = "🏁 **Service terminé** — voici le bilan de la journée."
+        footer = "Bilan de 13h30 · CROUS Normandie"
+    elif palier == PALIERS[0]:
         accroche = "🟢 **Le service est lancé** — il reste de la place."
-    elif kind == "palier" and palier == PALIERS[1]:
+    elif palier == PALIERS[1]:
         accroche = "🟠 **Ça se remplit** — il faut se dépêcher !!!"
-    elif kind == "palier":
-        accroche = "🔴 **Presque complet** — il faut se dépêcher !!!"
     else:
-        accroche = "⚡ **Ça bouge vite** — il faut se dépêcher !!!"
+        accroche = "🔴 **Presque complet** — il faut se dépêcher !!!"
 
+    titre_nb = f"# {fmt(repas)} repas servis" if kind == "final" else f"# {fmt(repas)} repas"
     description = (
-        f"# {fmt(repas)} repas\n"
+        f"{titre_nb}\n"
         f"sur {fmt(jauge)} · **{pct} %**\n\n"
         f"{barre(repas, jauge)}\n\n"
         f"{accroche}"
@@ -192,19 +239,44 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj, palier=None
     if kind == "ferme":
         fields.append({"name": "Repas servis", "value": f"{fmt(repas)} / {fmt(jauge)}", "inline": True})
         fields.append({"name": "Réouverture", "value": "Prochain service", "inline": True})
-    else:
+
+    elif kind == "ouverture":
+        fields += forecast_fields(forecast, jauge)
+        if forecast:
+            footer = f"Prévision basée sur {forecast['n']} jour{'s' if forecast['n'] > 1 else ''} · {footer}"
+
+    elif kind == "final":
+        if forecast:
+            ecart = repas - forecast["total"]
+            rel = round(ecart / forecast["total"] * 100) if forecast["total"] else 0
+            fields.append({"name": "📈 Prévision",
+                           "value": f"≈ {fmt(forecast['total'])} → **{signed(ecart)}** ({signed(rel)} %)",
+                           "inline": True})
+        else:
+            fields.append({"name": "📈 Prévision", "value": "Pas d'historique", "inline": True})
+        profil = stats.day_profile(day) if day else []
+        peak, low = stats.peak_low(profil)
+        if peak is not None:
+            fields.append({"name": "🔥 Pic de fréquentation",
+                           "value": f"**{stats.slot_label(peak)}**\n{fmt(profil[peak])} repas", "inline": True})
+            fields.append({"name": "😌 Moment le plus calme",
+                           "value": f"**{stats.slot_label(low)}**\n{fmt(profil[low])} repas", "inline": True})
+        if day and day.get("closed_at"):
+            fields.append({"name": "⛔ Jauge atteinte à",
+                           "value": day["closed_at"][:5].replace(":", "h"), "inline": True})
+
+    else:  # palier
         fields.append({"name": "Restants", "value": f"**{fmt(restant)}**", "inline": True})
         if state["last_sent"] is not None:
             fields.append({"name": "Depuis le dernier point",
-                           "value": f"**{repas - state['last_sent']:+d}**".replace("-", "−"),
-                           "inline": True})
+                           "value": f"**{signed(repas - state['last_sent'])}**", "inline": True})
         suivant = prochain_palier(repas, jauge, state)
         if suivant:
             fields.append({"name": "Prochain palier",
                            "value": "Complet" if suivant == jauge else f"{fmt(suivant)} repas",
                            "inline": True})
+        fields += forecast_fields(forecast, jauge, compact=True)
 
-    quand = (maj or datetime.now(TZ)).strftime("%H:%M")
     return {
         "author": {"name": f"{BOT_NAME} 🐐 · Affluence en direct"},
         "title": NOM,
@@ -212,7 +284,7 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj, palier=None
         "description": description,
         "color": couleur,
         "fields": fields,
-        "footer": {"text": f"Données de {quand} · CROUS Normandie"},
+        "footer": {"text": footer},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -229,50 +301,98 @@ def send(embed: dict) -> None:
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def check_once() -> bool:
-    """Un contrôle. Retourne True s'il n'y a plus rien à surveiller aujourd'hui (fermé)."""
-    now = datetime.now(TZ)
-    state = load_state(now.strftime("%Y-%m-%d"))
-    if state["closed"]:
-        print("Déjà marqué fermé aujourd'hui.")
+def _after(now: datetime, minute_of_day: int) -> bool:
+    return now.hour * 3600 + now.minute * 60 + now.second >= minute_of_day * 60
+
+
+def _step(now: datetime, state: dict, history: dict, day: dict) -> bool:
+    """Un contrôle. Retourne True quand il n'y a plus rien à faire aujourd'hui."""
+    # 0) Prévision du jour : calculée une seule fois, à partir des jours PRÉCÉDENTS
+    if not state["forecast_done"]:
+        state["forecast"] = stats.forecast(history, state["date"])
+        state["forecast_done"] = True
+    if state["forecast"] is not None:
+        day["forecast"] = state["forecast"]      # conservée pour l'image du vendredi
+
+    # 1) Lecture de l'API (inutile une fois la jauge atteinte : on attend simplement 13h30)
+    result = None
+    if not state["closed"]:
+        try:
+            result = fetch_affluence()
+        except requests.RequestException as e:
+            print(f"Erreur réseau : {e}")        # ponctuel : on réessaie au prochain tour
+    repas = jauge = maj = None
+    if result:
+        repas, jauge, maj = result
+        stats.record(day, now, repas, jauge)
+        state["last_repas"] = max(repas, state["last_repas"] or 0)
+        state["jauge"] = jauge
+        print(f"{now:%H:%M} — {repas}/{jauge} (dernier message : {state['last_sent']})")
+
+    # 2) 13h30 → nombre final de repas (valeur du dernier relevé valide : à 13h30 l'API
+    #    peut déjà être repassée « hors service »). Rien n'est envoyé s'il n'y a pas eu de service.
+    if _after(now, stats.END_MIN):
+        if state["last_repas"] is not None:
+            day["final"] = state["last_repas"]
+            send(build_embed("final", state["last_repas"], state["jauge"], state, maj, day=day))
+        else:
+            print("Aucun relevé aujourd'hui : pas de bilan.")
+        state["final_sent"] = True
         return True
 
-    result = fetch_affluence()
-    if result is None:
+    if not result:
         return False
-    repas, jauge, maj = result
-    print(f"{now:%H:%M} — {repas}/{jauge} (dernier message : {state['last_sent']})")
 
-    # 1) Jauge atteinte → fermé pour aujourd'hui (une seule fois)
+    # 3) Jauge atteinte → fermé pour aujourd'hui (une seule fois). Le bilan viendra à 13h30.
     if repas >= jauge:
-        send(build_embed("ferme", repas, jauge, state, maj))
+        send(build_embed("ferme", repas, jauge, state, maj, day=day))
         state["closed"], state["last_sent"] = True, repas
         state["paliers"] = sorted(set(state["paliers"]) | {p for p in PALIERS if p < jauge})
-        save_state(state)
-        return True
-
-    # 2) Palier(s) franchi(s) : un seul message pour le plus haut, tous marqués faits
-    franchis = [p for p in PALIERS if p < jauge and repas >= p and p not in state["paliers"]]
-    if franchis:
-        send(build_embed("palier", repas, jauge, state, maj, palier=max(franchis)))
-        state["paliers"] = sorted(set(state["paliers"]) | set(franchis))
-        state["last_sent"] = repas
-        save_state(state)
+        day["closed_at"], day["final"] = now.strftime("%H:%M:%S"), repas
         return False
 
-    # 3) Écart d'au moins SEUIL (plus ou moins) par rapport au dernier message
-    reference = state["last_sent"] if state["last_sent"] is not None else 0
-    if abs(repas - reference) >= SEUIL:
-        send(build_embed("ecart", repas, jauge, state, maj))
-        state["last_sent"] = repas
-        save_state(state)
+    franchis = [p for p in PALIERS if p < jauge and repas >= p and p not in state["paliers"]]
 
+    # 4) Ouverture : premier relevé valide à partir de 11h30 (pas de message les jours sans service)
+    if not state["opened"] and _after(now, stats.START_MIN):
+        send(build_embed("ouverture", repas, jauge, state, maj, day=day))
+        state["opened"], state["last_sent"] = True, repas
+        state["paliers"] = sorted(set(state["paliers"]) | set(franchis))   # run tardif : pas de doublon
+        return False
+
+    # 5) Palier(s) franchi(s) : un seul message pour le plus haut, tous marqués faits
+    if franchis:
+        send(build_embed("palier", repas, jauge, state, maj, palier=max(franchis), day=day))
+        state["paliers"] = sorted(set(state["paliers"]) | set(franchis))
+        state["last_sent"] = repas
     return False
+
+
+def check_once(now: datetime = None) -> bool:
+    now = now or datetime.now(TZ)
+    state = load_state(now.strftime("%Y-%m-%d"))
+    if state["final_sent"]:
+        print("Bilan final déjà envoyé aujourd'hui.")
+        return True
+    history = stats.load_history()
+    day = stats.get_day(history, state["date"])
+
+    done = _step(now, state, history, day)
+
+    save_state(state)
+    if not DRY_RUN:
+        stats.save_history(history)
+    return done
 
 
 def deadline() -> datetime:
     h, m = (int(x) for x in LOOP_UNTIL.split(":"))
     return datetime.now(TZ).replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def seconds_to_final(now: datetime) -> float:
+    target = now.replace(hour=stats.END_MIN // 60, minute=stats.END_MIN % 60, second=0, microsecond=0)
+    return (target - now).total_seconds()
 
 
 def main() -> int:
@@ -285,11 +405,15 @@ def main() -> int:
             if check_once():
                 break
         except requests.RequestException as e:
-            # Panne réseau/API ponctuelle : on réessaie au prochain tour
             print(f"Erreur réseau : {e}")
-        if POLL_SECONDS <= 0 or datetime.now(TZ) >= deadline():
+        now = datetime.now(TZ)
+        if POLL_SECONDS <= 0 or now >= deadline():
             break
-        time.sleep(POLL_SECONDS)
+        wait = POLL_SECONDS
+        to_final = seconds_to_final(now)
+        if 0 < to_final < wait:
+            wait = to_final + 1          # le dernier tour tombe pile à 13h30
+        time.sleep(wait)
     return 0
 
 

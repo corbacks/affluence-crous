@@ -5,8 +5,8 @@ on:
     # Vendredi soir ~18h15 Paris. Heure d'été ET d'hiver sont programmées ; le step
     # "Gate" écarte celle qui tombe hors de 18h00–21h00 Paris, et le script n'envoie
     # de toute façon qu'UNE image par semaine (drapeau `bilan_sent` dans l'historique).
-    - cron: "17 16 * * 5"   # 18h17 Paris (été, UTC+2)
-    - cron: "17 17 * * 5"   # 18h17 Paris (hiver, UTC+1)
+    - cron: "17 8 * * 5"   # 18h17 Paris (été, UTC+2)
+    - cron: "17 9 * * 5"   # 18h17 Paris (hiver, UTC+1)
 
   workflow_dispatch:
     inputs:

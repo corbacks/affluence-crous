@@ -5,16 +5,16 @@ on:
     # Le cron ne sert PLUS qu'à DÉMARRER le bot (GitHub ne garantit pas l'heure
     # exacte d'un cron : retards de 10 à 60 min possibles). Une fois lancé, le
     # script se contrôle lui-même toutes les 2 min jusqu'à 13h35 (heure de Paris).
-    # Départ visé 11h07 Paris, 30 min avant l'ouverture du service : même avec
-    # un retard, il démarre avant les premiers repas. Deux déclencheurs de secours
-    # 30 min plus tard. Heure d'été ET d'hiver sont programmées ; le step "Gate"
-    # écarte les départs hors de la plage 11h00–13h30 Paris.
-    - cron: "7 2 * * 1-5"
-    - cron: "37 2 * * 1-5"
-    - cron: "7 3 * * 1-5"    # 11h07 Paris (été, UTC+2)
-    - cron: "37 3 * * 1-5"   # secours 11h37 (été)
-    - cron: "7 4 * * 1-5"   # 11h07 Paris (hiver, UTC+1)
-    - cron: "37 4 * * 1-5"  # secours 11h37 (hiver)
+    # ATTENTION : les crons GitHub sont en UTC.
+    #   Été  (UTC+2) : 09:07 UTC = 11h07 Paris
+    #   Hiver (UTC+1) : 10:07 UTC = 11h07 Paris
+    # Départ visé 11h07, avec un secours à 11h37. Les deux saisons sont programmées ;
+    # le step "Gate" écarte les départs hors de la plage 11h00–13h30 Paris, et la
+    # concurrency empêche deux boucles en parallèle.
+    - cron: "7 9 * * 1-5"    # 11h07 Paris (été)
+    - cron: "37 9 * * 1-5"   # secours 11h37 (été)
+    - cron: "7 10 * * 1-5"   # 11h07 Paris (hiver) / 12h07 en été : dernier secours
+    - cron: "37 10 * * 1-5"  # secours 11h37 (hiver) / 12h37 en été
 
   workflow_dispatch:
     inputs:

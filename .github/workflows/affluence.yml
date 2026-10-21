@@ -9,6 +9,8 @@ on:
     # un retard, il démarre avant les premiers repas. Deux déclencheurs de secours
     # 30 min plus tard. Heure d'été ET d'hiver sont programmées ; le step "Gate"
     # écarte les départs hors de la plage 11h00–13h30 Paris.
+    - cron: "7 2 * * 1-5"
+    - cron: "37 2 * * 1-5"
     - cron: "7 3 * * 1-5"    # 11h07 Paris (été, UTC+2)
     - cron: "37 3 * * 1-5"   # secours 11h37 (été)
     - cron: "7 4 * * 1-5"   # 11h07 Paris (hiver, UTC+1)

@@ -9,23 +9,28 @@ Source : section « Affluence en direct » de la page du restaurant = iframe
 `https://restos.lescrous.fr/fiche/90-12-33-1`, alimentée par
 `https://restos.lescrous.fr/api/ecran/90-12-33-1`.
 
-## Ce que le bot envoie
+## Un seul message par jour, modifié en direct
 
-| Quand | Message |
+Le bot crée **un unique message Discord** au premier relevé valide à partir de 11h30, puis le
+**modifie** (requête `PATCH` du webhook) à chaque contrôle, toutes les 2 min. Tout l'embed est
+recalculé à chaque fois : nombre de repas, %, barre de progression, couleur, accroche, prochain
+palier, repas des 10 dernières minutes, prévision et heure des données.
+
+| Moment | Contenu du message |
 |---|---|
-| **Ouverture** (premier relevé valide à partir de 11h30) | Le Crous est ouvert + nombre de repas + **prévision du jour** : total attendu, **créneau de 15 min le plus chargé** (ex. `12h15–12h30`) et **le plus calme** |
-| 100 repas | 🟢 Le service est lancé (+ prévision et pic prévu) |
-| 500 repas | 🟠 Ça se remplit — il faut se dépêcher !!! (+ prévision et pic prévu) |
-| 1 000 repas | 🔴 Presque complet — il faut se dépêcher !!! (+ prévision et pic prévu) |
-| Jauge atteinte (1 100) | ⛔ Crous fermé pour aujourd'hui (une seule fois) |
-| **13h30** | 🏁 **Nombre final de repas** + écart avec la prévision + pic et creux réels |
-| **Vendredi ~18h15** | 📊 Image de la semaine (lundi → vendredi) |
+| 11h30 → jauge | Embed « live » : l'accroche et la couleur suivent les paliers — < 100 « Le Crous est ouvert » · 100 🟢 « Il reste de la place » · 500 🟠 « Ça se remplit — il faut se dépêcher !!! » · 1 000 🔴 « Presque complet — il faut se dépêcher !!! » |
+| Jauge atteinte (1 100) | ⛔ « Capacité atteinte — le Crous est fermé pour aujourd'hui » (le bot arrête de lire l'API) |
+| **13h30** | 🏁 Le même message devient le **bilan** : nombre final de repas, écart avec la prévision, pic et creux réels (+ heure de fermeture si la jauge a été atteinte) |
+| **Vendredi ~18h15** | 📊 Image de la semaine (lundi → vendredi), dans un message à part |
 
-Le palier « tous les 200 repas » a été supprimé (et le réglage `SEUIL` avec). Chaque
-événement n'est envoyé qu'une fois par jour ; hors service l'API n'a pas de jauge et le bot se tait.
+L'identifiant du message est gardé dans `affluence_state.json` (cache GitHub, remis à zéro
+chaque jour) : le lendemain, un nouveau message est créé. Si le message est supprimé à la main,
+le bot en recrée un au tour suivant. Les jours sans service (API sans jauge), il ne publie rien.
+
+⚠️ Discord n'envoie une notification qu'à la **création** du message, pas à ses modifications :
+les passages de paliers ne « sonnent » plus.
 
 À 13h30 le bot utilise le **dernier relevé valide** (l'API peut déjà être repassée « hors service »).
-Si la jauge a été atteinte plus tôt, le bilan de 13h30 est quand même envoyé.
 
 ## Prévisions
 
@@ -80,6 +85,6 @@ DRY_RUN=1 python bilan.py                          # écrit bilan_preview.png
 
 ## Réglages
 
-`affluence_bot.py` : `PALIERS` (100, 500, 1000), `CROUS_ID`, `POLL_SECONDS`.
+`affluence_bot.py` : `PALIERS` (100, 500, 1000 : accroches et couleurs), `CROUS_ID`, `POLL_SECONDS`.
 `stats.py` : `START_MIN` / `END_MIN` (11h30 / 13h30), `SLOT_MIN` (15), `LOOKBACK` (30 jours),
 `SAME_WEEKDAY_WEIGHT` (2.0), `MIN_TOTAL` (50).

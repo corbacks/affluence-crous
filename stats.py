@@ -158,6 +158,14 @@ def day_profile(day: dict) -> list:
     return out
 
 
+def recent_flow(day: dict, now, window: int = 600):
+    """Repas servis pendant les `window` dernières secondes (None si pas assez de relevés)."""
+    samples = sorted((hms_to_sec(h), c) for h, c in (day.get("samples") or []))
+    t = now.hour * 3600 + now.minute * 60 + now.second
+    a, b = _cum(samples, t - window), _cum(samples, t)
+    return None if a is None or b is None else max(0, round(b - a))
+
+
 def peak_low(profile: list):
     """(index du créneau le plus chargé, index du plus calme) ; (None, None) sans donnée."""
     known = [i for i, v in enumerate(profile) if v is not None]

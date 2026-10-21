@@ -6,13 +6,13 @@ Lit l'affluence « en direct » (la même que l'iframe de la page du restaurant 
 https://restos.lescrous.fr/fiche/90-12-33-1 → API /api/ecran/90-12-33-1)
 et prévient sur Discord avec un embed (barre de progression, couleurs Crous).
 
-Messages envoyés (chacun au plus une fois par jour) :
-    • OUVERTURE (≈ 11h30)   : le Crous est ouvert + nombre de repas + PRÉVISION du jour
-                              (total attendu, créneau de 15 min le plus chargé / le plus calme) ;
-    • PALIERS 100 / 500 / 1000 repas (+ prévision et pic prévu) ;
-    • JAUGE atteinte        : « Crous fermé pour aujourd'hui » ;
-    • BILAN FINAL (13h30)   : nombre final de repas, écart avec la prévision,
-                              pic et creux réels.
+UN SEUL message Discord par jour : créé au premier relevé valide à partir de 11h30, puis
+MODIFIÉ (PATCH du webhook) à chaque contrôle — repas, %, barre, couleur, accroche, prochain
+palier, prévision et heure des données sont recalculés à chaque fois :
+    • en service : embed « live » (la couleur et l'accroche suivent les paliers 100/500/1000) ;
+    • jauge atteinte : l'embed passe en « Crous fermé pour aujourd'hui » ;
+    • 13h30 : le même message devient le BILAN FINAL (nombre final de repas, écart avec la
+      prévision, pic et creux réels).
 
 Chaque relevé est enregistré dans data/history.json : c'est cet historique qui
 alimente les prévisions et l'image du bilan hebdomadaire (bilan.py, vendredi soir).
@@ -65,10 +65,8 @@ COL_FERME   = 0x7A2E5B   # aubergine clair, lisible sur fond sombre
 # ══════════════════════════════════════════════════════════════════════════════
 
 STATE_DEFAULTS = {
-    "last_sent": None,       # repas au dernier message (pour « depuis le dernier point »)
-    "closed": False,         # jauge atteinte
-    "paliers": [],           # paliers déjà notifiés
-    "opened": False,         # message d'ouverture envoyé
+    "message_id": None,      # identifiant du message Discord du jour (celui qu'on modifie)
+    "closed": False,         # jauge atteinte (message passé en « fermé »)
     "final_sent": False,     # bilan de 13h30 envoyé
     "last_repas": None,      # dernier nombre de repas valide (sert au bilan de 13h30)
     "jauge": None,
@@ -174,18 +172,23 @@ def barre(repas: int, jauge: int, segments: int = 12) -> str:
     return carre * plein + "⬛" * (segments - plein)
 
 
-def prochain_palier(repas: int, jauge: int, state: dict):
-    for p in (*PALIERS, jauge):
-        if p > repas and p not in state["paliers"]:
-            return p
-    return None
+def prochain_palier(repas: int, jauge: int):
+    return next((p for p in (*PALIERS, jauge) if p > repas), None)
 
 
-def forecast_fields(forecast, jauge: int, compact: bool = False) -> list:
-    """Champs « prévision » : total attendu, pic (créneau de 15 min) et, hors mode compact, creux."""
+def accroche_live(repas: int) -> str:
+    if repas >= PALIERS[2]:
+        return "🔴 **Presque complet** — il faut se dépêcher !!!"
+    if repas >= PALIERS[1]:
+        return "🟠 **Ça se remplit** — il faut se dépêcher !!!"
+    if repas >= PALIERS[0]:
+        return "🟢 **Il reste de la place** — le service bat son plein."
+    return "🍽️ **Le Crous est ouvert** — service jusqu'à 13h30."
+
+
+def forecast_fields(forecast, jauge: int) -> list:
+    """Champs « prévision » : total attendu, pic et creux (créneaux de 15 min)."""
     if not forecast:
-        if compact:
-            return []
         return [{"name": "📈 Prévision du jour",
                  "value": "Pas encore d'historique — elle apparaîtra dès qu'un service complet aura été enregistré.",
                  "inline": False}]
@@ -196,16 +199,15 @@ def forecast_fields(forecast, jauge: int, compact: bool = False) -> list:
         fields.append({"name": "🔥 Pic prévu",
                        "value": f"**{stats.slot_label(forecast['peak'])}**\n~{fmt(forecast['peak_flow'])} repas",
                        "inline": True})
-        if not compact:
-            fields.append({"name": "😌 Le plus calme",
-                           "value": f"**{stats.slot_label(forecast['low'])}**\n~{fmt(forecast['low_flow'])} repas",
-                           "inline": True})
+        fields.append({"name": "😌 Le plus calme",
+                       "value": f"**{stats.slot_label(forecast['low'])}**\n~{fmt(forecast['low_flow'])} repas",
+                       "inline": True})
     return fields
 
 
 def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
-                palier=None, day=None) -> dict:
-    """kind : 'ouverture' | 'palier' | 'ferme' | 'final'."""
+                day=None, now=None) -> dict:
+    """Embed COMPLET, recalculé à chaque appel. kind : 'live' | 'ferme' | 'final'."""
     carre, couleur = tier(repas, jauge)
     pct = pourcentage(repas, jauge)
     restant = max(jauge - repas, 0)
@@ -215,17 +217,11 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
 
     if kind == "ferme":
         accroche = "⛔ **Capacité atteinte — le Crous est fermé pour aujourd'hui.**"
-    elif kind == "ouverture":
-        accroche = "🍽️ **Le Crous est ouvert** — service jusqu'à 13h30."
     elif kind == "final":
         accroche = "🏁 **Service terminé** — voici le bilan de la journée."
         footer = "Bilan de 13h30 · CROUS Normandie"
-    elif palier == PALIERS[0]:
-        accroche = "🟢 **Le service est lancé** — il reste de la place."
-    elif palier == PALIERS[1]:
-        accroche = "🟠 **Ça se remplit** — il faut se dépêcher !!!"
     else:
-        accroche = "🔴 **Presque complet** — il faut se dépêcher !!!"
+        accroche = accroche_live(repas)
 
     titre_nb = f"# {fmt(repas)} repas servis" if kind == "final" else f"# {fmt(repas)} repas"
     description = (
@@ -239,11 +235,6 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
     if kind == "ferme":
         fields.append({"name": "Repas servis", "value": f"{fmt(repas)} / {fmt(jauge)}", "inline": True})
         fields.append({"name": "Réouverture", "value": "Prochain service", "inline": True})
-
-    elif kind == "ouverture":
-        fields += forecast_fields(forecast, jauge)
-        if forecast:
-            footer = f"Prévision basée sur {forecast['n']} jour{'s' if forecast['n'] > 1 else ''} · {footer}"
 
     elif kind == "final":
         if forecast:
@@ -265,17 +256,19 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
             fields.append({"name": "⛔ Jauge atteinte à",
                            "value": day["closed_at"][:5].replace(":", "h"), "inline": True})
 
-    else:  # palier
+    else:  # live
         fields.append({"name": "Restants", "value": f"**{fmt(restant)}**", "inline": True})
-        if state["last_sent"] is not None:
-            fields.append({"name": "Depuis le dernier point",
-                           "value": f"**{signed(repas - state['last_sent'])}**", "inline": True})
-        suivant = prochain_palier(repas, jauge, state)
+        flux = stats.recent_flow(day, now) if day and now else None
+        if flux is not None:
+            fields.append({"name": "10 dernières minutes", "value": f"**+{fmt(flux)}**", "inline": True})
+        suivant = prochain_palier(repas, jauge)
         if suivant:
             fields.append({"name": "Prochain palier",
                            "value": "Complet" if suivant == jauge else f"{fmt(suivant)} repas",
                            "inline": True})
-        fields += forecast_fields(forecast, jauge, compact=True)
+        fields += forecast_fields(forecast, jauge)
+        if forecast:
+            footer = f"Prévision basée sur {forecast['n']} jour{'s' if forecast['n'] > 1 else ''} · {footer}"
 
     return {
         "author": {"name": f"{BOT_NAME} 🐐 · Affluence en direct"},
@@ -289,13 +282,37 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
     }
 
 
-def send(embed: dict) -> None:
+def send(embed: dict, state: dict) -> None:
+    """Crée le message du jour la première fois, puis le MODIFIE (même identifiant)."""
     if DRY_RUN or not WEBHOOK_URL:
         print("[DRY-RUN] " + json.dumps(embed, ensure_ascii=False, indent=2))
         return
-    r = requests.post(WEBHOOK_URL, json={"username": BOT_NAME, "embeds": [embed]}, timeout=20)
+    mid = state.get("message_id")
+    if mid:
+        r = requests.patch(f"{WEBHOOK_URL}/messages/{mid}", json={"embeds": [embed]}, timeout=20)
+        if r.status_code != 404:
+            r.raise_for_status()
+            print(f"✅ Message {mid} mis à jour")
+            return
+        print("Message introuvable (supprimé ?) : on en recrée un.")
+        state["message_id"] = None
+    # wait=true : Discord renvoie le message créé, donc son identifiant
+    r = requests.post(WEBHOOK_URL, params={"wait": "true"},
+                      json={"username": BOT_NAME, "embeds": [embed]}, timeout=20)
     r.raise_for_status()
-    print(f"✅ Discord → {r.status_code}")
+    state["message_id"] = r.json()["id"]
+    save_state(state)        # tout de suite : un plantage ne doit pas faire perdre l'identifiant
+    print(f"✅ Message {state['message_id']} créé")
+
+
+def publish(embed: dict, state: dict) -> bool:
+    """send() sans lever d'exception : en cas d'échec réseau, on réessaiera au prochain tour."""
+    try:
+        send(embed, state)
+        return True
+    except (requests.RequestException, KeyError, ValueError) as e:
+        print(f"Discord : échec ({e})")
+        return False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
@@ -327,44 +344,35 @@ def _step(now: datetime, state: dict, history: dict, day: dict) -> bool:
         stats.record(day, now, repas, jauge)
         state["last_repas"] = max(repas, state["last_repas"] or 0)
         state["jauge"] = jauge
-        print(f"{now:%H:%M} — {repas}/{jauge} (dernier message : {state['last_sent']})")
+        print(f"{now:%H:%M} — {repas}/{jauge}")
 
-    # 2) 13h30 → nombre final de repas (valeur du dernier relevé valide : à 13h30 l'API
-    #    peut déjà être repassée « hors service »). Rien n'est envoyé s'il n'y a pas eu de service.
+    # 2) 13h30 → le même message devient le bilan final (valeur du dernier relevé valide :
+    #    à 13h30 l'API peut déjà être repassée « hors service »). Pas de service = pas de message.
     if _after(now, stats.END_MIN):
         if state["last_repas"] is not None:
             day["final"] = state["last_repas"]
-            send(build_embed("final", state["last_repas"], state["jauge"], state, maj, day=day))
+            if not publish(build_embed("final", state["last_repas"], state["jauge"], state, maj,
+                                       day=day, now=now), state):
+                return False                     # échec Discord : on retente au prochain tour
         else:
-            print("Aucun relevé aujourd'hui : pas de bilan.")
+            print("Aucun relevé aujourd'hui : pas de message.")
         state["final_sent"] = True
         return True
 
-    if not result:
+    # 3) Pas de message avant l'ouverture (11h30), ni les jours sans service (pas de relevé valide)
+    if not result or not _after(now, stats.START_MIN):
         return False
 
-    # 3) Jauge atteinte → fermé pour aujourd'hui (une seule fois). Le bilan viendra à 13h30.
+    # 4) Jauge atteinte → « fermé pour aujourd'hui » ; plus de lecture jusqu'au bilan de 13h30
     if repas >= jauge:
-        send(build_embed("ferme", repas, jauge, state, maj, day=day))
-        state["closed"], state["last_sent"] = True, repas
-        state["paliers"] = sorted(set(state["paliers"]) | {p for p in PALIERS if p < jauge})
-        day["closed_at"], day["final"] = now.strftime("%H:%M:%S"), repas
+        day.setdefault("closed_at", now.strftime("%H:%M:%S"))
+        day["final"] = repas
+        if publish(build_embed("ferme", repas, jauge, state, maj, day=day, now=now), state):
+            state["closed"] = True
         return False
 
-    franchis = [p for p in PALIERS if p < jauge and repas >= p and p not in state["paliers"]]
-
-    # 4) Ouverture : premier relevé valide à partir de 11h30 (pas de message les jours sans service)
-    if not state["opened"] and _after(now, stats.START_MIN):
-        send(build_embed("ouverture", repas, jauge, state, maj, day=day))
-        state["opened"], state["last_sent"] = True, repas
-        state["paliers"] = sorted(set(state["paliers"]) | set(franchis))   # run tardif : pas de doublon
-        return False
-
-    # 5) Palier(s) franchi(s) : un seul message pour le plus haut, tous marqués faits
-    if franchis:
-        send(build_embed("palier", repas, jauge, state, maj, palier=max(franchis), day=day))
-        state["paliers"] = sorted(set(state["paliers"]) | set(franchis))
-        state["last_sent"] = repas
+    # 5) Cas normal : création du message au 1er relevé, puis mise à jour à chaque tour
+    publish(build_embed("live", repas, jauge, state, maj, day=day, now=now), state)
     return False
 
 

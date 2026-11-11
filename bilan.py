@@ -64,11 +64,9 @@ MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août
 
 def build_row(d: date, rec) -> dict:
     row = {"date": d, "data": False}
-    if not rec or not rec.get("samples"):
-        return row
+    if not rec or not stats.is_reliable(rec):
+        return row                      # jour fermé, vide ou suivi interrompu : pas de carte de données
     total = stats.day_total(rec)
-    if not total:
-        return row
     profil = stats.day_profile(rec)
     peak, low = stats.peak_low(profil)
     fc = rec.get("forecast") or {}

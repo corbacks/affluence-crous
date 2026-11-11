@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+import closure
 import stats
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -47,6 +48,8 @@ PALIERS     = (100, 500, 1000)                  # la jauge pleine (1100) est gé
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "0"))
 LOOP_UNTIL   = os.getenv("LOOP_UNTIL", "13:35")      # heure de Paris, fin de boucle (garde-fou)
 
+SKIP_CLOSURE_CHECK = os.getenv("SKIP_CLOSURE_CHECK", "0") in ("1", "true", "True")  # tests locaux
+NO_SERVICE_AFTER   = 12 * 60        # 12h00 : toujours 0 repas → pas de service aujourd'hui
 FORCE_RUN = os.getenv("FORCE_RUN", "0") in ("1", "true", "True")  # ignore le garde-fou week-end
 DRY_RUN   = os.getenv("DRY_RUN", "0") in ("1", "true", "True")    # affiche au lieu d'envoyer
 
@@ -72,6 +75,8 @@ STATE_DEFAULTS = {
     "jauge": None,
     "forecast_done": False,  # prévision du jour calculée (une seule fois, le matin)
     "forecast": None,
+    "no_service": False,     # restaurant fermé / aucun repas : le bot s'arrête pour la journée
+    "partial": False,        # relevés interrompus : le total de la journée n'est pas fiable
 }
 
 
@@ -205,6 +210,24 @@ def forecast_fields(forecast, jauge: int) -> list:
     return fields
 
 
+JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+
+def forecast_basis(forecast: dict, date_key: str) -> str:
+    """Texte du pied de page : sur quoi repose la prévision (ex : « 3 mardis + semaine dernière »)."""
+    k = forecast.get("same_weekday_days")
+    if k is None:                                  # ancien format de prévision
+        n = forecast.get("ref_days") or forecast.get("n") or 0
+        return f"{n} jour{'s' if n > 1 else ''}"
+    jour = JOURS[datetime.fromisoformat(date_key).weekday()]
+    plur = jour if jour.endswith("s") else jour + "s"
+    parts = [f"{k} {plur if k > 1 else jour}" if k else "aucun même jour"]
+    if forecast.get("last_week") is not None:
+        parts.append("semaine dernière")
+    parts.append(f"{forecast.get('ref_days', 0)} jours au total")
+    return " + ".join(parts[:-1]) + f" ({parts[-1]})"
+
+
 def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
                 day=None, now=None) -> dict:
     """Embed COMPLET, recalculé à chaque appel. kind : 'live' | 'ferme' | 'final'."""
@@ -220,10 +243,15 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
     elif kind == "final":
         accroche = "🏁 **Service terminé** — voici le bilan de la journée."
         footer = "Bilan de 13h30 · CROUS Normandie"
+        if state.get("partial"):
+            accroche = "🏁 **Service terminé** — relevés incomplets aujourd'hui : total indicatif (au moins)."
+            footer = "Relevés interrompus · CROUS Normandie"
     else:
         accroche = accroche_live(repas)
 
     titre_nb = f"# {fmt(repas)} repas servis" if kind == "final" else f"# {fmt(repas)} repas"
+    if kind == "final" and state.get("partial"):
+        titre_nb = f"# ≥ {fmt(repas)} repas relevés"
     description = (
         f"{titre_nb}\n"
         f"sur {fmt(jauge)} · **{pct} %**\n\n"
@@ -235,6 +263,11 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
     if kind == "ferme":
         fields.append({"name": "Repas servis", "value": f"{fmt(repas)} / {fmt(jauge)}", "inline": True})
         fields.append({"name": "Réouverture", "value": "Prochain service", "inline": True})
+
+    elif kind == "final" and state.get("partial"):
+        fields.append({"name": "ℹ️ Pourquoi ?",
+                       "value": "Le suivi s'est arrêté avant la fin du service : cette journée n'entre pas dans les prévisions.",
+                       "inline": False})
 
     elif kind == "final":
         if forecast:
@@ -268,7 +301,7 @@ def build_embed(kind: str, repas: int, jauge: int, state: dict, maj,
                            "inline": True})
         fields += forecast_fields(forecast, jauge)
         if forecast:
-            footer = f"Prévision basée sur {forecast['n']} jour{'s' if forecast['n'] > 1 else ''} · {footer}"
+            footer = f"Prévision : {forecast_basis(forecast, state['date'])} · {footer}"
 
     return {
         "author": {"name": f"{BOT_NAME} 🐐 · Affluence en direct"},
@@ -346,16 +379,32 @@ def _step(now: datetime, state: dict, history: dict, day: dict) -> bool:
         state["jauge"] = jauge
         print(f"{now:%H:%M} — {repas}/{jauge}")
 
+    # 1 bis) Filet de sécurité : toujours 0 repas à 12h = restaurant fermé / pas de service
+    #        (ex. jour férié non annoncé sur la page). On n'enregistre rien et on s'arrête.
+    if _after(now, NO_SERVICE_AFTER) and not state["closed"] and stats.looks_closed(day):
+        print("Aucun repas relevé à 12h : pas de service aujourd'hui — arrêt, rien n'est enregistré.")
+        stats.discard_day(history, state["date"])
+        state["no_service"] = True
+        return True
+
     # 2) 13h30 → le même message devient le bilan final (valeur du dernier relevé valide :
     #    à 13h30 l'API peut déjà être repassée « hors service »). Pas de service = pas de message.
     if _after(now, stats.END_MIN):
-        if state["last_repas"] is not None:
-            day["final"] = state["last_repas"]
+        if state["last_repas"]:
+            samples = day.get("samples") or []
+            fresh = bool(day.get("closed_at")) or (
+                samples and stats.hms_to_sec(samples[-1][0]) >= stats.FINAL_FRESH)
+            if fresh:
+                day["final"] = state["last_repas"]
+            else:                                # le suivi s'est interrompu : total non fiable
+                day["partial"] = True
+                state["partial"] = True
             if not publish(build_embed("final", state["last_repas"], state["jauge"], state, maj,
                                        day=day, now=now), state):
                 return False                     # échec Discord : on retente au prochain tour
         else:
-            print("Aucun relevé aujourd'hui : pas de message.")
+            print("Aucun repas relevé aujourd'hui : pas de message.")
+            stats.discard_day(history, state["date"])
         state["final_sent"] = True
         return True
 
@@ -379,13 +428,17 @@ def _step(now: datetime, state: dict, history: dict, day: dict) -> bool:
 def check_once(now: datetime = None) -> bool:
     now = now or datetime.now(TZ)
     state = load_state(now.strftime("%Y-%m-%d"))
-    if state["final_sent"]:
-        print("Bilan final déjà envoyé aujourd'hui.")
+    if state["final_sent"] or state["no_service"]:
+        print("Rien à faire aujourd'hui (bilan envoyé ou pas de service).")
         return True
     history = stats.load_history()
     day = stats.get_day(history, state["date"])
 
     done = _step(now, state, history, day)
+
+    # Un jour sans aucun relevé n'est jamais conservé (évite les entrées vides dans l'historique)
+    if not day.get("samples") and not day.get("final"):
+        history["days"].pop(state["date"], None)
 
     save_state(state)
     if not DRY_RUN:
@@ -407,6 +460,13 @@ def main() -> int:
     if datetime.now(TZ).weekday() >= 5 and not FORCE_RUN:
         print("Week-end : silence.")
         return 0
+
+    if not SKIP_CLOSURE_CHECK:
+        verdict = closure.is_closed_today(datetime.now(TZ).date())
+        print(f"Restaurant : {'FERMÉ' if verdict['closed'] else 'ouvert'} ({verdict['reason']}).")
+        if verdict["closed"]:
+            print("Fermé aujourd'hui : le bot ne se lance pas (rien lu, rien enregistré).")
+            return 0
 
     while True:
         try:

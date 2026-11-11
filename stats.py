@@ -13,9 +13,13 @@ Historique : `data/history.json`, versionné dans le dépôt (commité par le wo
         "samples":   [["11:31:02", 4], ["11:33:02", 11], ...],   # (heure, repas cumulés)
         "jauge":     1100,
         "closed_at": "12:41:07" | null,       # heure où la jauge a été atteinte
-        "final":     874 | null,              # repas à 13h30
-        "forecast":  {...} | null             # prévision faite le matin même
+        "final":     874,                     # repas à 13h30 (absent si relevés incomplets)
+        "partial":   true,                    # (optionnel) le bot n'a pas pu suivre toute la journée
+        "forecast":  {...}                    # prévision faite le matin même (voir forecast())
     }
+
+Les jours fermés / sans service ne sont PAS enregistrés (ils faussaient les prévisions) ;
+leurs dates sont listées dans `meta.no_service`.
 
 Créneaux : le service 11h30 → 13h30 est découpé en 8 créneaux de 15 min. Le nombre
 de repas d'un créneau = repas cumulés à la fin − repas cumulés au début (interpolés
@@ -23,6 +27,7 @@ linéairement entre deux relevés).
 """
 import json
 import os
+import statistics
 from datetime import date
 
 BASE_DIR     = os.getenv("GITHUB_WORKSPACE") or os.path.dirname(os.path.abspath(__file__))
@@ -39,9 +44,19 @@ MAX_GAP     = 10 * 60             # trou max (s) entre deux relevés pour interp
 RECORD_FROM = 11 * 3600           # on n'enregistre que dans cette plage (s)
 RECORD_TO   = 14 * 3600
 MIN_TOTAL   = 50                  # un « jour » à moins de 50 repas n'entre pas dans les prévisions
-LOOKBACK    = 30                  # nombre de jours d'historique pris en compte
-SAME_WEEKDAY_WEIGHT = 2.0         # un lundi pèse 2× plus pour prévoir un lundi
+LOOKBACK    = 40                  # nombre de jours fiables pris en compte (niveau général)
+MAX_SAME_WD = 8                   # nombre de « mêmes jours de la semaine » pris en compte
 MAX_DAYS    = 400                 # taille max de l'historique conservé
+FINAL_FRESH = END_MIN * 60 - 15 * 60   # un total n'est fiable que si le dernier relevé est ≥ 13h15
+JAUGE_DEFAUT = 1100
+
+# ── Prévision ────────────────────────────────────────────────────────────────
+# prévision = (1 − W_LAST_WEEK) × « jour type » + W_LAST_WEEK × « même jour la semaine dernière »
+#   « jour type » = moyenne/médiane des mardis (si on prévoit un mardi), tirée vers le niveau
+#   général des autres jours tant qu'on a peu de mardis (PRIOR_DAYS = poids de ce niveau général
+#   exprimé en « nombre de mardis équivalents »).
+W_LAST_WEEK = 0.25
+PRIOR_DAYS  = 1.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,6 +92,7 @@ def load_history(path: str = None) -> dict:
         h = {}
     h.setdefault("meta", {})
     h.setdefault("days", {})
+    migrate(h)
     return h
 
 
@@ -115,6 +131,8 @@ def record(day: dict, now, repas: int, jauge: int) -> None:
     samples = day["samples"]
     if samples and samples[-1][0] == hms:
         return
+    if samples and int(repas) < samples[-1][1]:
+        return          # le compteur est cumulatif : une baisse = remise à zéro de l'API en fin de service
     samples.append([hms, int(repas)])
     day["jauge"] = int(jauge)
 
@@ -183,57 +201,152 @@ def day_total(day: dict):
 
 
 def is_complete(day: dict) -> bool:
-    """Journée suffisamment suivie (début de service ET fin ou fermeture) pour servir de référence."""
+    """Journée suffisamment suivie (début de service ET fin ou fermeture)."""
     s = day.get("samples") or []
-    if not s:
+    if not s or day.get("partial"):
         return False
     first, last = hms_to_sec(s[0][0]), hms_to_sec(s[-1][0])
     if first > (START_MIN + 25) * 60:              # run démarré après ~11h55
         return False
-    return bool(day.get("closed_at")) or last >= (END_MIN - 30) * 60
+    return bool(day.get("closed_at")) or last >= FINAL_FRESH
+
+
+def is_reliable(day: dict) -> bool:
+    """Jour utilisable comme référence (prévisions) ET affichable dans le bilan :
+    suivi complet, au moins MIN_TOTAL repas."""
+    if not is_complete(day):
+        return False
+    total = day_total(day)
+    return total is not None and total >= MIN_TOTAL
+
+
+def looks_closed(day: dict) -> bool:
+    """Des relevés, mais jamais un seul repas : restaurant fermé / pas de service."""
+    s = day.get("samples") or []
+    return bool(s) and max(c for _, c in s) == 0
+
+
+def discard_day(history: dict, key: str, reason: str = "no_service") -> None:
+    """Supprime un jour de l'historique et note sa date (jour sans service)."""
+    history["days"].pop(key, None)
+    lst = history["meta"].setdefault(reason, [])
+    if key not in lst:
+        lst.append(key)
+        lst.sort()
+        del lst[:-60]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NETTOYAGE / MIGRATION (idempotent, appliqué à chaque lecture de l'historique)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def migrate(h: dict) -> None:
+    """Retire ce qui a mal été enregistré par les anciennes versions :
+      • jours vides (créés sans aucun relevé) ;
+      • jours où le compteur est resté à 0 (fermeture, week-end prolongé, fin de service seule) ;
+      • totaux « final » non fiables (relevés interrompus avant 13h15 sans fermeture) ;
+      • anciennes clés de prévision (`n` → `ref_days`)."""
+    for key in list(h["days"]):
+        d = h["days"][key]
+        samples = d.get("samples") or []
+        if not samples:
+            h["days"].pop(key)
+            continue
+        if looks_closed(d):
+            discard_day(h, key)
+            continue
+        if d.get("final") is not None and not d.get("closed_at"):
+            if hms_to_sec(samples[-1][0]) < FINAL_FRESH:
+                d.pop("final", None)
+                d["partial"] = True
+        fc = d.get("forecast")
+        if isinstance(fc, dict) and "n" in fc:
+            fc["ref_days"] = fc.pop("n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PRÉVISION
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _central(vals: list):
+    """Valeur centrale d'une série (du plus ancien au plus récent) : moitié médiane
+    (insensible aux jours exceptionnels), moitié moyenne pondérée par la récence."""
+    if not vals:
+        return None
+    w = [1 + 0.25 * i for i in range(len(vals))]        # récence : le plus récent pèse un peu plus
+    wmean = sum(wi * v for wi, v in zip(w, vals)) / sum(w)
+    return 0.5 * statistics.median(vals) + 0.5 * wmean
+
+
+def _estimate(same_wd: list, everyday: list, last_week):
+    """Estimation d'une valeur (total ou créneau) pour le jour à prévoir."""
+    base_all = _central(everyday)
+    base_wd  = _central(same_wd)
+    if base_wd is None:
+        base = base_all
+    elif base_all is None:
+        base = base_wd
+    else:
+        k = len(same_wd)
+        base = (k * base_wd + PRIOR_DAYS * base_all) / (k + PRIOR_DAYS)
+    if base is None:
+        return last_week
+    if last_week is None:
+        return base
+    return (1 - W_LAST_WEEK) * base + W_LAST_WEEK * last_week
+
+
 def forecast(history: dict, today_key: str):
     """
-    Prévision pour `today_key` à partir des jours précédents (moyenne pondérée :
-    les mêmes jours de la semaine comptent double). Retourne None sans historique.
+    Prévision pour `today_key`. Retourne None sans historique fiable.
 
-        {"total": 850,                       # repas attendus (arrondi à 10)
+    Elle repose SURTOUT sur le jour de la semaine : pour un mardi, moyenne/médiane des
+    mardis précédents ; elle est complétée par le niveau général de fréquentation (tant
+    qu'on a peu de mardis) et par l'affluence du même jour la semaine précédente.
+
+        {"total": 850,                       # repas attendus (arrondi à 10, plafonné à la jauge)
          "peak": 4, "peak_flow": 142,        # créneau le plus chargé (index) + repas attendus dedans
          "low": 0,  "low_flow": 31,          # créneau le plus calme
-         "n": 8}                             # nombre de jours utilisés
+         "ref_days": 12,                     # nombre de jours fiables utilisés au total
+         "same_weekday_days": 3,             # dont nombre de jours de la même semaine (3 mardis)
+         "last_week": 984 | null}            # repas le même jour la semaine précédente
     """
-    today_wd = date.fromisoformat(today_key).weekday()
-    cands = []
+    today = date.fromisoformat(today_key)
+    wd = today.weekday()
+    days = []
     for k, d in history["days"].items():
-        if k >= today_key or not is_complete(d):
-            continue
-        total = day_total(d)
-        if total is None or total < MIN_TOTAL:
-            continue
-        cands.append((k, d, total))
-    cands = sorted(cands, key=lambda x: x[0])[-LOOKBACK:]
-    if not cands:
+        if k < today_key and is_reliable(d):
+            days.append((k, d, day_total(d), day_profile(d)))
+    days.sort(key=lambda x: x[0])
+    days = days[-LOOKBACK:]
+    if not days:
         return None
 
-    wsum = tsum = 0.0
-    slot_w = [0.0] * N_SLOTS
-    slot_s = [0.0] * N_SLOTS
-    for k, d, total in cands:
-        w = SAME_WEEKDAY_WEIGHT if date.fromisoformat(k).weekday() == today_wd else 1.0
-        wsum += w
-        tsum += w * total
-        for i, flow in enumerate(day_profile(d)):
-            if flow is not None:
-                slot_w[i] += w
-                slot_s[i] += w * flow
+    wd_days = [x for x in days if date.fromisoformat(x[0]).weekday() == wd][-MAX_SAME_WD:]
 
-    out = {"total": int(round(tsum / wsum / 10.0)) * 10, "n": len(cands)}
-    avg = [slot_s[i] / slot_w[i] if slot_w[i] else None for i in range(N_SLOTS)]
+    # Semaine précédente : le même jour il y a 7 jours ; à défaut (fermé ce jour-là), le plus
+    # récent même jour de la semaine des 14 derniers jours.
+    lw = None
+    for x in reversed(wd_days):
+        if 0 < (today - date.fromisoformat(x[0])).days <= 14:
+            lw = x
+            break
+
+    total = _estimate([x[2] for x in wd_days], [x[2] for x in days], lw[2] if lw else None)
+    jauge = int(days[-1][1].get("jauge") or JAUGE_DEFAUT)
+    out = {
+        "total": int(round(min(total, jauge) / 10.0)) * 10,
+        "ref_days": len(days),
+        "same_weekday_days": len(wd_days),
+        "last_week": lw[2] if lw else None,
+    }
+
+    avg = []
+    for i in range(N_SLOTS):
+        avg.append(_estimate(
+            [x[3][i] for x in wd_days if x[3][i] is not None],
+            [x[3][i] for x in days if x[3][i] is not None],
+            lw[3][i] if lw and lw[3][i] is not None else None))
     peak, low = peak_low(avg)
     if peak is not None:
         out.update(peak=peak, peak_flow=int(round(avg[peak])),
